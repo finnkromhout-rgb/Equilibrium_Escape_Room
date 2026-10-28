@@ -1,0 +1,679 @@
+<!--
+  ====================================================================
+  TOUCH-EE MORSE TRANSMITTER (phone, Data Foundry link)
+  WHO MADE IT : BASED ON ANOTHER GROUP'S MODULE - we rewired / changed it for our escape room
+  WHAT IT DOES: Two buttons: blue = short, yellow = long morse signal. Sends the code number by number and waits until the control room has typed each number.
+  WHERE IT RUNS: On the phone of the person who sends the morse code. Original Touch-ee page of the other group; we changed the morse patterns, the waiting per number and the phone layout (iPhone 11 Pro).
+  CODE        : change SECRET_CODE below (digits 1-5 only) and keep it the same as CFG.FIRE_CODE in main_game_screen.html
+  ====================================================================
+-->
+<html><head>
+  <title>Morse Code Transmitter</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#000000">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="apple-touch-icon" href="https://oocsi.id.tue.nl/assets/images/OOCSI_logo_no_text.png">
+  <link rel="stylesheet" type="text/css" href="https://oocsi.id.tue.nl/assets/css/pico.indigo.min.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Stardos+Stencil:wght@700&family=IBM+Plex+Mono:wght@400;600&display=swap">
+  <script type="text/javascript" src="https://oocsi.id.tue.nl/assets/js/p5.min.js"></script>
+  <script type="text/javascript" src="https://oocsi.id.tue.nl/assets/js/oocsi-web.js"></script>
+  <script type="text/javascript" src="https://oocsi.id.tue.nl/assets/js/things/oocsi-things.min.js"></script>
+  <style type="text/css">
+    html, body {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        overflow: hidden;
+        touch-action: none;
+        background: #121110;
+    }
+    html, body { position: fixed; inset: 0; width: 100%; overscroll-behavior: none; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; }
+    /* the canvas sits inside the safe area: not under the iPhone notch / rounded corners / home bar */
+    #canvasContainer { position: fixed; left: env(safe-area-inset-left, 0px); top: env(safe-area-inset-top, 0px); }
+    #safe { position: fixed; left: 0; top: 0; width: 0; height: 0; visibility: hidden; pointer-events: none;
+            padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px) env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px); }
+    canvas { display: block; }
+    /* the oocsi-things team bar would cover the title on a phone */
+    #header { display: none !important; }
+  </style>
+</head>
+<body>
+    <div id="header"></div>
+    <div id="safe"></div>
+    <div id="canvasContainer"></div>
+<script type="text/javascript">
+
+  // define your teamspace
+  oocsiThingsConfig = {
+    // our team: becomes the OOCSI channel "OOCSI-things/team-3"
+    // (the valve ESP32 listens on exactly this channel)
+    teamspace: "Team 3"
+  };
+
+  // ---------------------------------------------------------------
+  // THE CODE TO SEND (must be the same as FIRE_CODE in the main html!)
+  // digits 1-5 only. Every number is its REAL morse code (5 signals):
+  //   B = blue button = short (dot),  Y = yellow button = long (dash)
+  // (the receivers can use a normal morse code chart to turn the signals back into numbers)
+  // ---------------------------------------------------------------
+  const SECRET_CODE = '4152';
+  const PATTERNS = {
+    '1': 'BYYYY',   // .----
+    '2': 'BBYYY',   // ..---
+    '3': 'BBBYY',   // ...--
+    '4': 'BBBBY',   // ....-
+    '5': 'BBBBB'    // .....
+  };
+
+  // thing variables
+  let x, y;
+
+  // define thing
+  function thing() {
+
+    // register this thing with your own chosen name and data path 'touchee';
+    // no input, the only output we use is 'x', but we leave 'y' in, otherwise it crashes
+    oocsiThings.register('Control board', 'touchee', [], ['x', 'y'])
+
+    // define own shared data
+    x = oocsiThings.data('x');
+    y = oocsiThings.data('y');
+
+    // listen to the game channel of the main html:
+    // phone_open = the code was entered correctly in the other room -> the box opens
+    // stage      = a new game started -> start over
+    OOCSI.subscribe('OOCSI-things/team-3-game', function (m) {
+      const d = (m && m.data) || m || {};
+      if (d.phone_open) boxOpen = true;
+      if (d.stage === 'boiler' || d.stage === 'fire') { boxOpen = false; progress = 0; doneAt = 0; confirmed = 0; }
+      // number by number: the control room has entered this many numbers correctly
+      if (d.code_progress !== undefined) {
+        const c = constrain(Number(d.code_progress) || 0, 0, SECRET_CODE.length);
+        if (c < confirmed) { confirmed = c; progress = min(progress, c * SIG); doneAt = 0; }   // the other room started over
+        else confirmed = c;
+      }
+      // the control room entered a number wrong: send that number again
+      if (d.code_digit_ok === false && Number(d.code_digit) === confirmed + 1) {
+        progress = confirmed * SIG; doneAt = 0; redoAt = millis(); redoDigit = confirmed + 1;
+      }
+    });
+  }
+
+  // define not-shared data
+  let center = undefined;
+  let wasPressed = false;
+  let pressZone = null;       // 'blue' / 'yellow' while a button is held
+  let symbols = [];           // the whole code as a flat list of 'B' / 'Y'
+  let progress = 0;           // how many signals were already sent correctly
+  let doneAt = 0;             // time the full code was sent
+  let boxOpen = false;        // true as soon as the main html reports 'phone_open' (code entered in the other room)
+  let wrongAt = 0;            // time of the last wrong button
+  // number by number: after every number, wait until the control room has entered it correctly
+  const SIG = 5;              // signals per number (real morse code of 1-5)
+  let confirmed = 0;          // numbers the control room has entered correctly
+  let redoAt = 0, redoDigit = 0;   // the control room entered a number wrong -> send it again
+  function waiting() { return progress < symbols.length && progress >= (confirmed + 1) * SIG; }   // to send one 'released' message when the finger lifts
+
+  // --- aesthetic palette (Blackice Outpost) ---
+  const STENCIL = 'Stardos Stencil';
+  const MONO = 'IBM Plex Mono';
+  const AMBER = [230, 165, 30];
+
+  // stop the browser from scrolling, bouncing or zooming while the buttons are pressed
+  for (const ev of ['touchstart', 'touchmove', 'touchend', 'gesturestart', 'gesturechange', 'dblclick', 'contextmenu']) {
+    document.addEventListener(ev, e => e.preventDefault(), { passive: false });
+  }
+  window.addEventListener('scroll', () => window.scrollTo(0, 0));
+
+  function setup() {
+    pixelDensity(min(2, displayDensity()));   // sharp, but light enough for every phone
+    let canvas = createCanvas(screenW(), screenH());
+    canvasReady = true;
+    canvas.parent('canvasContainer');
+    center = createVector(width / 2, height / 2);
+    for (const d of SECRET_CODE) for (const m of (PATTERNS[d] || '')) symbols.push(m);
+  }
+
+  // a button was pressed and released: does it match the next signal of the code?
+  function registerPress(zone) {
+    if (progress >= symbols.length) return;
+    if (waiting()) return;      // wait until the control room has entered the last number
+    const expected = symbols[progress] === 'B' ? 'blue' : 'yellow';
+    if (zone === expected) {
+      progress++;
+      if (progress >= symbols.length) doneAt = millis();
+    } else {
+      wrongAt = millis();
+    }
+  }
+
+
+  // --- layout: wide screens (laptop / tablet) vs narrow screens (phone in portrait) ---
+  // Everything is drawn on a virtual screen that is scaled to the real screen,
+  // so it looks the same on every phone, tablet or laptop:
+  //  sideways: at least 640 x 390 virtual pixels, upright: at least 390 x 700.
+  // W / H = size of that virtual screen, G = scale factor, MX / MY = finger position on it.
+  let W = 640, H = 390, G = 1, MX = 0, MY = 0;
+  function updateScale() {
+    if (width >= height) G = min(height / 390, width / 640);
+    else G = min(width / 390, height / 700);
+    W = width / G;
+    H = height / G;
+    MX = mouseX / G;
+    MY = mouseY / G;
+  }
+
+  function isCompact() { return H > W; }        // phone held upright
+  function isShort() { return !isCompact(); }   // phone held sideways (also laptop / tablet)
+
+  // positions of the two big buttons + hit size (half W of the square plate)
+  function layout() {
+    if (isShort()) {
+      const top = 82, bottom = codePanelRect().y - 6;
+      const s = constrain((bottom - top) / 150, 0.5, 1);
+      const my = (top + bottom) / 2;
+      return { s: s, blue: { x: W * 0.22, y: my }, yellow: { x: W * 0.78, y: my } };
+    }
+    if (!isCompact()) {
+      return { s: 1, blue: { x: W / 4, y: H / 2 }, yellow: { x: 3 * W / 4, y: H / 2 } };
+    }
+    const top = 118, bottom = codePanelRect().y - 8;
+    const s = constrain((bottom - top - 12) / 2 / 150, 0.5, 1);
+    const mid = (top + bottom) / 2;
+    const off = 75 * s + 6;
+    return { s: s, blue: { x: W / 2, y: mid - off }, yellow: { x: W / 2, y: mid + off } };
+  }
+
+  function codePanelRect() {
+    if (isShort()) { const ph = 62; return { x: 28, y: H - 24 - ph, w: W - 56, h: ph }; }
+    if (!isCompact()) { const ph = 88; return { x: 105, y: H - 65 - ph - 10, w: W - 210, h: ph }; }
+    const ph = 124;
+    return { x: 26, y: H - 26 - ph, w: W - 52, h: ph };
+  }
+
+  // which button is under the finger / mouse?
+  function zoneAt(mx, my) {
+    const L = layout(), r = 70 * L.s;
+    if (abs(mx - L.blue.x) < r && abs(my - L.blue.y) < r) return 'blue';
+    if (abs(mx - L.yellow.x) < r && abs(my - L.yellow.y) < r) return 'yellow';
+    return null;
+  }
+
+  // text that always fits the screen W
+  function fitText(str, x, y, size) {
+    textSize(size);
+    const m = W - 24;
+    if (textWidth(str) > m) textSize(size * m / textWidth(str));
+    text(str, x, y);
+  }
+
+  // size of the part of the screen you can really see:
+  // the browser window (without the Safari / Chrome bars) minus the safe area
+  // (iPhone notch, rounded corners and home bar), so nothing is ever cut off.
+  function inset(side) {
+    const el = document.getElementById('safe');
+    return el ? (parseFloat(getComputedStyle(el)['padding' + side]) || 0) : 0;
+  }
+  function viewW() { return window.visualViewport ? window.visualViewport.width : window.innerWidth; }
+  function viewH() { return window.visualViewport ? window.visualViewport.height : window.innerHeight; }
+  function screenW() { return max(200, Math.floor(viewW() - inset('Left') - inset('Right'))); }
+  function screenH() { return max(200, Math.floor(viewH() - inset('Top') - inset('Bottom'))); }
+  let canvasReady = false;   // only resize once p5 has made the canvas
+  function refit() { if (!canvasReady) return; if (width !== screenW() || height !== screenH()) resizeCanvas(screenW(), screenH()); }
+  function windowResized() { refit(); }
+  // phones report the new size a moment after rotating, so measure again a few times
+  window.addEventListener('orientationchange', () => { for (const t of [100, 400, 900]) setTimeout(refit, t); });
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', refit);
+
+  // --- the code panel: every number of the code as its morse code of 5 blue (short) / yellow (long) signals ---
+  function drawCodePanel() {
+    const R = codePanelRect();
+    const px = R.x, pw = R.w, ph = R.h, py = R.y;
+
+    fill(12, 12, 11);
+    rect(px, py, pw, ph, 8);
+    dashedBox(px, py, pw, ph, 8);
+
+    // title + legend
+    textFont(MONO);
+    textStyle(NORMAL);
+    textAlign(LEFT, CENTER);
+    textSize(11);
+    fill(190, 180, 155);
+    if (pw > 560) text('CODE TO TRANSMIT', px + 14, py + 14);   // on narrow screens only the legend fits
+    textAlign(RIGHT, CENTER);
+    let rx = px + pw - 14;
+    const t2 = 'LONG', t1 = 'SHORT';
+    fill(190, 180, 155);
+    text(t2, rx, py + 14);
+    rx -= textWidth(t2) + 8;
+    fill(AMBER[0], AMBER[1], AMBER[2]);
+    ellipse(rx - 5, py + 14, 10, 10);
+    rx -= 10 + 22;
+    fill(190, 180, 155);
+    text(t1, rx, py + 14);
+    rx -= textWidth(t1) + 8;
+    fill(130, 185, 205);
+    ellipse(rx - 5, py + 14, 10, 10);
+
+    // size of one unit, so the whole code always fits in the panel
+    const gap = 0.6, labelW = 1.6, groupGap = 2.2;
+    const perDigit = labelW + 5 * 1 + 4 * gap;     // W of one number + its 5 signals (in units)
+    const compact = isCompact();
+    const cols = compact ? 2 : SECRET_CODE.length;
+    const rows = compact ? Math.ceil(SECRET_CODE.length / 2) : 1;
+    const cellUnits = perDigit + (compact ? 0 : groupGap);
+    const u = min(18, (pw - 28) / (cols * perDigit + (cols - 1) * (compact ? 2.5 : groupGap)));
+    const totalW = cols * perDigit * u + (cols - 1) * (compact ? 2.5 : groupGap) * u;
+    const startX = px + (pw - totalW) / 2;
+
+    let k = 0;   // index in the flat list
+    const pulse = 0.5 + 0.5 * sin(millis() / 180);
+    let di = 0;
+    for (const d of SECRET_CODE) {
+      const col = compact ? di % 2 : di;
+      const row = compact ? Math.floor(di / 2) : 0;
+      let cx = startX + col * (perDigit + (compact ? 2.5 : groupGap)) * u;
+      const cy = compact ? py + 54 + row * 38 : (isShort() ? py + 40 : py + 58);
+      di++;
+      // the digit itself
+      textAlign(LEFT, CENTER);
+      textFont(STENCIL);
+      textStyle(BOLD);
+      textSize(u * 1.6);
+      fill(190, 180, 155);
+      text(d, cx, cy - 1);
+      cx += labelW * u;
+      for (const m of PATTERNS[d]) {
+        const w = u;
+        const isDone = k < progress;
+        const isNext = k === progress && !waiting();
+        const isLater = k >= (confirmed + 1) * SIG;   // not yet: wait for the control room
+        const a = isDone ? 70 : (isLater ? 110 : 255);
+        if (m === 'B') fill(130, 185, 205, a); else fill(AMBER[0], AMBER[1], AMBER[2], a);
+        noStroke();
+        ellipse(cx + w / 2, cy, u, u);          // every signal is the same size circle
+        if (isNext && progress < symbols.length) {
+          noFill();
+          stroke(255, 255, 255, 120 + 135 * pulse);
+          strokeWeight(2);
+          ellipse(cx + w / 2, cy, u + 7, u + 7);
+          noStroke();
+        }
+        cx += w + gap * u;
+        k++;
+      }
+    }
+    noStroke();
+
+    // feedback
+    textFont(MONO);
+    textStyle(NORMAL);
+    textSize(11);
+    if (progress >= symbols.length) {
+      fill(110, 175, 95);
+      textAlign(RIGHT, CENTER);
+      text('CODE SENT', px + pw - 14, py + ph - 12);
+    } else if (millis() - wrongAt < 700) {
+      fill(200, 80, 60);
+      if (isCompact()) { textAlign(LEFT, CENTER); text('WRONG BUTTON', px + 14, py + 14); }
+      else { textAlign(RIGHT, CENTER); text('WRONG BUTTON', px + pw - 14, py + ph - 12); }
+    }
+  }
+
+  // --- drawing helpers (only visuals) ---
+
+  // little screw head in the panel corners
+  function screw(sx, sy) {
+    noStroke();
+    fill(15);
+    ellipse(sx, sy + 1, 13, 13);
+    fill(110, 112, 108);
+    ellipse(sx, sy, 11, 11);
+    fill(170, 172, 165);
+    ellipse(sx - 1.5, sy - 1.5, 4, 4);
+  }
+
+  // yellow/black hazard stripe bar
+  function hazard(hx, hy, hw, hh) {
+    noStroke();
+    fill(25, 22, 15);
+    rect(hx, hy, hw, hh);
+    drawingContext.save();
+    drawingContext.beginPath();
+    drawingContext.rect(hx, hy, hw, hh);
+    drawingContext.clip();
+    fill(200, 150, 20);
+    for (let sx = hx - hh; sx < hx + hw + hh; sx += 34) {
+      quad(sx, hy + hh, sx + 17, hy + hh, sx + 17 + hh, hy, sx + hh, hy);
+    }
+    drawingContext.restore();
+  }
+
+  // dashed amber outline, like the boxes in the terminal UI
+  function dashedBox(bx, by, bw, bh, r) {
+    noFill();
+    stroke(AMBER[0], AMBER[1], AMBER[2], 90);
+    strokeWeight(1.5);
+    drawingContext.setLineDash([6, 5]);
+    rect(bx, by, bw, bh, r);
+    drawingContext.setLineDash([]);
+    noStroke();
+  }
+
+  // recessed metal plate behind a big button
+  function buttonPlate(cx, cy) {
+    noStroke();
+    fill(10, 10, 9);
+    rect(cx - 75, cy - 73, 150, 150, 10);
+    fill(44, 46, 42);
+    rect(cx - 75, cy - 75, 150, 150, 10);
+    stroke(255, 255, 255, 8);
+    strokeWeight(1);
+    for (let ly = cy - 70; ly < cy + 72; ly += 3) line(cx - 70, ly, cx + 70, ly);
+    noStroke();
+    dashedBox(cx - 75, cy - 75, 150, 150, 10);
+    screw(cx - 62, cy - 62);
+    screw(cx + 62, cy - 62);
+    screw(cx - 62, cy + 62);
+    screw(cx + 62, cy + 62);
+    // dark ring around the button
+    fill(12, 12, 11);
+    ellipse(cx, cy, 116, 116);
+  }
+
+  function draw() {
+  // always fill the whole screen (phone browsers change their size while loading / when the toolbars hide)
+  refit();
+  updateScale();
+  push();
+  scale(G);
+  // background
+  background(18, 17, 15);
+  noStroke();
+
+  // --- control board ---
+  const C = isCompact();
+  const S = isShort();
+  const K = C || S;               // small screen: thin frame
+  const om = K ? 8 : 70;          // outer margin
+  const im = K ? 18 : 95;         // inner margin
+  const topY = K ? (S ? 6 : 8) : 40;
+  // outer panel (brushed dark metal)
+  fill(8);
+  rect(om + 2, topY + 4, W - 2 * om, H - topY * 2, K ? 14 : 24);
+  fill(46, 48, 44);
+  rect(om, topY, W - 2 * om, H - topY * 2, K ? 14 : 24);
+  stroke(255, 255, 255, 7);
+  strokeWeight(1);
+  for (let ly = topY + 10; ly < H - topY - 10; ly += 3) line(om + 12, ly, W - om - 12, ly);
+  noStroke();
+
+  // corner screws
+  const sc = K ? 18 : 16;
+  screw(om + sc, topY + sc);
+  screw(W - om - sc, topY + sc);
+  screw(om + sc, H - topY - sc);
+  screw(W - om - sc, H - topY - sc);
+
+  // inner panel
+  const iy = S ? 14 : (C ? 16 : 65);
+  fill(26, 27, 24);
+  rect(im, iy, W - 2 * im, H - 2 * iy, 6);
+  stroke(255, 255, 255, 5);
+  strokeWeight(1);
+  for (let ly = iy + 5; ly < H - iy - 5; ly += 3) line(im + 5, ly, W - im - 5, ly);
+  noStroke();
+  dashedBox(im, iy, W - 2 * im, H - 2 * iy, 6);
+
+  // title + status LED
+  textFont(STENCIL);
+  textStyle(BOLD);
+  textAlign(CENTER, CENTER);
+  const titleY = S ? 30 : (C ? 44 : 90);
+  textSize(K ? (S ? 17 : 18) : 22);
+  let title = "MORSE CODE TRANSMITTER";
+  let tw = textWidth(title);
+  fill(90, 160, 80, 70);
+  ellipse(W / 2 - tw / 2 - 18, titleY + 1, 18, 18);
+  fill(110, 175, 95);
+  ellipse(W / 2 - tw / 2 - 18, titleY + 1, 9, 9);
+  fill(190, 180, 155);
+  text(title, W / 2, titleY);
+
+  // hazard stripe
+  hazard(im + 10, S ? 45 : (C ? 62 : 115), W - 2 * im - 20, S ? 7 : 9);
+
+  // instruction lines under the stripe
+  textFont(MONO);
+  textStyle(NORMAL);
+  textAlign(CENTER, CENTER);
+  fill(AMBER[0], AMBER[1], AMBER[2], 200);
+  fitText(K ? "SEND THE CODE TO THE OTHER ROOM" : "EQUILIBRIUM OUTPOST  //  SEND THE CODE BELOW TO THE OTHER ROOM", W / 2, S ? 62 : (C ? 88 : 144), K ? 11 : 13);
+  fill(190, 180, 155, 170);
+  if (redoAt > 0 && millis() - redoAt < 5000) {
+    // the control room entered a number wrong: say so where the instructions are
+    fill(225, 90, 65);
+    fitText('THE OTHER ROOM ENTERED NUMBER ' + redoDigit + ' WRONG - SEND IT AGAIN', W / 2, S ? 77 : (C ? 106 : 164), K ? 11 : 13);
+  } else fitText(K ? "PRESS BLUE / YELLOW IN THE ORDER SHOWN" : "PRESS BLUE AND YELLOW IN THE ORDER SHOWN, ONE TAP PER SIGNAL", W / 2, S ? 77 : (C ? 106 : 164), K ? 10 : 12);
+
+  // --- the two big buttons (drawn at their own centre, scaled on small screens) ---
+  const L = layout();
+  push();
+  translate(L.blue.x, L.blue.y);
+  scale(L.s);
+  buttonPlate(0, 0);
+  fill(70, 120, 140);
+  ellipse(0, 3, 100, 100);
+  fill(130, 185, 205);
+  ellipse(0, 0, 100, 100);
+  fill(255, 255, 255, 35);
+  ellipse(-14, -16, 40, 28);
+  pop();
+
+  push();
+  translate(L.yellow.x, L.yellow.y);
+  scale(L.s);
+  buttonPlate(0, 0);
+  fill(150, 100, 15);
+  ellipse(0, 3, 100, 100);
+  fill(AMBER[0], AMBER[1], AMBER[2]);
+  ellipse(0, 0, 100, 100);
+  fill(255, 255, 255, 35);
+  ellipse(-14, -16, 40, 28);
+  pop();
+
+  // --- code panel ---
+  drawCodePanel();
+
+  // --- waiting for the control room: the buttons are locked until they entered this number ---
+  if (waiting()) drawWaitBanner();
+
+  // --- mouse ---
+  if (mouseIsPressed) {
+    let pv = createVector(MX,MY);
+    let v = p5.Vector.sub(center,pv);
+    let thickness = map(v.mag(), 0, max(W / 2, H / 2), 10, 2);
+
+    // finger / mouse dot, only shown when a button is pressed
+    pressZone = zoneAt(MX, MY);
+    if (waiting()) pressZone = null;          // locked while waiting for the other room
+    if (pressZone === 'blue') {
+      fill(40, 100, 130);
+      ellipse(pv.x, pv.y, 60, 60);
+      fill(170, 215, 230);
+      ellipse(pv.x, pv.y, 40, 40);
+    } else if (pressZone === 'yellow') {
+      fill(200, 120, 10);
+      ellipse(pv.x, pv.y, 60, 60);
+      fill(255, 200, 80);
+      ellipse(pv.x, pv.y, 40, 40);
+    }
+    if (progress >= symbols.length || waiting()) pressZone = null;   // code sent / waiting: buttons are locked
+
+    // send a FIXED value for the button that is pressed (not the finger position),
+    // so the receiver always knows exactly: blue button = 0.6, yellow button = -0.6
+    // (Touch-ee coordinates are swapped: positive = left/blue, negative = right/yellow)
+    // anywhere else on the screen = 0 = nothing
+    // (the value alternates a tiny bit every frame, so it is sent over and over while the circle is held
+    //  and the receiver knows the circle is still pressed)
+    const wiggle = (frameCount % 2) * 0.01;
+    x(pressZone === 'blue' ? 0.6 + wiggle : (pressZone === 'yellow' ? -0.6 - wiggle : 0));
+    y(0);
+    oocsiThings.activity();
+    wasPressed = true;
+  } else if (wasPressed) {
+    // finger lifted: send a neutral position once, so the LED in the other room switches off
+    // (exactly as long as the button is held = short and long signals for the morse code)
+    x(0);
+    y(0);
+    oocsiThings.activity();
+    wasPressed = false;
+    if (progress >= symbols.length) {
+      // locked after sending: only the SEND AGAIN button does anything
+      const b = againButton();
+      if (millis() - doneAt > 800 && MX > b.x && MX < b.x + b.w && MY > b.y && MY < b.y + b.h) {
+        progress = min(progress, confirmed * SIG); doneAt = 0; boxOpen = false;
+      }
+    } else if (waiting()) {
+      // locked while waiting: only the SEND AGAIN button in the banner does anything
+      const b = repeatButton();
+      if (MX > b.x && MX < b.x + b.w && MY > b.y && MY < b.y + b.h) progress = confirmed * SIG;
+    } else if (pressZone) registerPress(pressZone);
+    pressZone = null;
+  }
+  if (progress >= symbols.length) drawSentOverlay();
+  pop();
+}
+
+// "repeat" button in the waiting banner: send the same number once more
+function repeatButton() {
+  const L = layout(), cy = (L.blue.y + L.yellow.y) / 2;
+  const w = min(240, W * 0.5);
+  if (isCompact()) return { x: W / 2 - w / 2, y: L.blue.y + 40, w: w, h: 40 };
+  return { x: W / 2 - w / 2, y: cy + 22, w: w, h: 40 };
+}
+
+function drawWaitBanner() {
+  const L = layout();
+  const pulse = 0.5 + 0.5 * sin(millis() / 250);
+  const C = isCompact();
+  const bw = C ? W - 60 : min(W * 0.52, 420), bh = C ? 150 : 128;
+  const bx = W / 2 - bw / 2;
+  const by = C ? L.blue.y - 70 : (L.blue.y + L.yellow.y) / 2 - bh / 2 - 6;
+  noStroke();
+  fill(10, 10, 9, 235);
+  rect(bx, by, bw, bh, 10);
+  stroke(AMBER[0], AMBER[1], AMBER[2], 120 + 120 * pulse);
+  strokeWeight(2);
+  noFill();
+  rect(bx, by, bw, bh, 10);
+  noStroke();
+  textAlign(CENTER, CENTER);
+  textFont(STENCIL);
+  textStyle(BOLD);
+  fill(AMBER[0], AMBER[1], AMBER[2]);
+  const n = confirmed + 1;
+  const t1 = 'NUMBER ' + n + ' SENT';
+  textSize(22);
+  text(t1, W / 2, by + 24);
+  textFont(MONO);
+  textStyle(NORMAL);
+  fill(190, 180, 155);
+  const t2 = 'WAIT UNTIL THE OTHER ROOM HAS ENTERED IT';
+  textSize(11);
+  if (textWidth(t2) > bw - 20) textSize(11 * (bw - 20) / textWidth(t2));
+  text(t2, W / 2, by + 50);
+  const b = repeatButton();
+  fill(30, 30, 26);
+  stroke(AMBER[0], AMBER[1], AMBER[2]);
+  strokeWeight(1.5);
+  rect(b.x, b.y, b.w, b.h, 6);
+  noStroke();
+  fill(AMBER[0], AMBER[1], AMBER[2]);
+  textSize(13);
+  text('SEND NUMBER ' + n + ' AGAIN', b.x + b.w / 2, b.y + b.h / 2);
+}
+
+function againButton() {
+  if (isShort()) {
+    const w = min(280, W * 0.4);
+    return { x: W * 0.6 - w / 2, y: H / 2 + 30, w: w, h: 46 };
+  }
+  const w = min(300, W - 80), h = 56;
+  return { x: W / 2 - w / 2, y: H / 2 + 150, w: w, h: h };
+}
+
+// big confirmation over the whole screen once the full code has been sent
+function drawSentOverlay() {
+  const age = millis() - doneAt;
+  const a = min(1, age / 250);
+  noStroke();
+  fill(8, 10, 8, 235 * a);
+  rect(0, 0, W, H);
+  const pulse = 0.5 + 0.5 * sin(millis() / 250);
+  const S = isShort();
+  // S (phone sideways): ring on the left, text + button on the right
+  const rx = S ? W * 0.2 : W / 2, ry = S ? H / 2 : H / 2 - 70;
+  const tx = S ? W * 0.6 : W / 2;
+  const titleY = S ? H / 2 - 62 : ry + 105;
+  const l1 = S ? H / 2 - 22 : ry + 142;
+  const l2 = S ? H / 2 : ry + 164;
+  const rs = S ? min(1, H / 330) : 1;
+  const maxW = S ? W * 0.62 : W - 24;
+  // ring + check mark: amber while waiting, green when the box opens
+  const ring = boxOpen ? [110, 175, 95] : AMBER;
+  noFill();
+  stroke(ring[0], ring[1], ring[2], 90 + 120 * pulse);
+  strokeWeight(6);
+  ellipse(rx, ry, (130 + 10 * pulse) * rs, (130 + 10 * pulse) * rs);
+  stroke(ring[0], ring[1], ring[2]);
+  strokeWeight(10 * rs);
+  strokeCap(ROUND);
+  line(rx - 28 * rs, ry + 2 * rs, rx - 8 * rs, ry + 24 * rs);
+  line(rx - 8 * rs, ry + 24 * rs, rx + 32 * rs, ry - 22 * rs);
+  noStroke();
+  const lineText = (str, y) => {
+    textSize(14);
+    if (textWidth(str) > maxW) textSize(14 * maxW / textWidth(str));
+    text(str, tx, y);
+  };
+  textAlign(CENTER, CENTER);
+  textFont(STENCIL);
+  textStyle(BOLD);
+  textSize(S ? min(46, H / 7) : min(64, W / 8));
+  if (boxOpen) {
+    fill(110, 175, 95);
+    text('BOX OPENING', tx, titleY);
+    textFont(MONO);
+    textStyle(NORMAL);
+    fill(190, 180, 155);
+    lineText('THE BOX IN THIS ROOM IS OPENING', l1);
+    lineText('TAKE THE WALKIE TALKIE AND CONTACT THE CONTROL ROOM', l2);
+  } else {
+    fill(AMBER[0], AMBER[1], AMBER[2]);
+    text('CODE SENT', tx, titleY);
+    textFont(MONO);
+    textStyle(NORMAL);
+    fill(190, 180, 155);
+    lineText('WAITING FOR THE OTHER ROOM TO ENTER THE CODE', l1);
+    fill(AMBER[0], AMBER[1], AMBER[2], 120 + 135 * pulse);
+    lineText('THE BOX OPENS AS SOON AS IT IS CORRECT...', l2);
+  }
+  // send again
+  const b = againButton();
+  fill(30, 30, 26);
+  stroke(AMBER[0], AMBER[1], AMBER[2]);
+  strokeWeight(2);
+  rect(b.x, b.y, b.w, b.h, 8);
+  noStroke();
+  fill(AMBER[0], AMBER[1], AMBER[2]);
+  textSize(16);
+  text('SEND AGAIN', b.x + b.w / 2, b.y + b.h / 2);
+}
+
+</script>
+</body></html>

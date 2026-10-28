@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<!--
+  ====================================================================
+  WALKIE TALKIE - PHONE RECEIVER (speaker in the box)
+  WHO MADE IT : OUR OWN MODULE (team 3) - made by us for this escape room (our own pages, adapted to OOCSI)
+  WHAT IT DOES: Plays the sound from the control room laptop. Tap 'Setup Connection' once on the phone.
+  WHERE IT RUNS: On the phone inside the box, through the cloudflared link: https://<your-tunnel>/walkie_phone_receiver.html
+  ====================================================================
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Escape Room Walkie-Talkie - Phone</title>
+    <style>
+        body { font-family: sans-serif; text-align: center; margin-top: 30px; }
+        .top-container { margin-bottom: 30px; }
+
+        /* Three times larger button */
+        button#setupBtn {
+            padding: 45px 90px;
+            font-size: 54px;
+            cursor: pointer;
+            border-radius: 15px;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            font-weight: bold;
+        }
+
+        #status { font-weight: bold; margin-top: 30px; font-size: 20px; }
+    </style>
+    <!-- OOCSI (an external address, so it works on localhost:3000 and on the tunnel link) -->
+    <script src="https://oocsi.id.tue.nl/assets/js/oocsi-web.js"></script>
+</head>
+<body>
+    <div class="top-container">
+        <button id="setupBtn">Setup Connection</button>
+    </div>
+
+    <h1>Escape Room Receiver</h1>
+    <div id="status">Status: Waiting for control room connection...</div>
+
+    <audio id="remoteAudio" autoplay playsinline></audio>
+
+    <script>
+        /* =====================================================================
+           WALKIE TALKIE - PHONE (receiver). One way: control room laptop -> this phone. No microphone.
+           The audio goes over WebRTC like before. The signalling (offer / answer / ICE candidates)
+           now goes over OOCSI instead of Socket.IO, so server.js only has to serve the files.
+
+           Tap "Setup Connection" once (the phone only plays sound after a tap). From then on this page
+           asks the laptop for audio every 2 seconds, so the ORDER DOES NOT MATTER: the laptop can be
+           started before or after this page. The laptop starts by itself when the box opens.
+
+           OOCSI channels
+             OOCSI-things/team-3-game     in : phone_open (the box opened), stage 'boiler' (new run)
+             OOCSI-things/team-3-walkie   in/out: { walkie:'ready'|'offer'|'answer'|'ice'|'bye', from, sdp, cand }
+           ===================================================================== */
+        const CH_GAME   = 'OOCSI-things/team-3-game';
+        const CH_WALKIE = 'OOCSI-things/team-3-walkie';
+        const statusDiv = document.getElementById('status');
+        const remoteAudio = document.getElementById('remoteAudio');
+        const rtcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+
+        let peerConnection = null;
+        let pendingIce = [];
+        let started = false;         // "Setup Connection" was tapped
+        let live = false;            // audio is playing
+        let connectingSince = 0;
+        let readyTimer = null;
+
+        function send(d) { d.from = 'phone'; try { OOCSI.send(CH_WALKIE, d); } catch (e) { console.warn(e); } }
+
+        /* ---------- Setup Connection (tap once) ---------- */
+        document.getElementById('setupBtn').onclick = async () => {
+            if (started) return;
+            started = true;
+            statusDiv.innerText = 'Status: Setting up connection...';
+            // the first tap unlocks sound on the phone
+            remoteAudio.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=';
+            remoteAudio.play().catch(() => {});
+            try { await navigator.wakeLock.request('screen'); } catch (e) {}      // keep the screen on
+            askForAudio();
+            statusDiv.innerText = 'Status: Waiting for control room connection...';
+        };
+
+        // keep asking the laptop for audio until it is live (this is what makes the order not matter)
+        function askForAudio() {
+            send({ walkie: 'ready' });
+            clearInterval(readyTimer);
+            readyTimer = setInterval(() => {
+                if (live) return;
+                if (peerConnection && Date.now() - connectingSince > 12000) closeCall();   // stuck: start over
+                if (!peerConnection) send({ walkie: 'ready' });
+            }, 2000);
+        }
+
+        /* ---------- OOCSI ---------- */
+        if (window.OOCSI) {
+            OOCSI.connect('wss://oocsi.id.tue.nl/ws');
+            OOCSI.subscribe(CH_GAME, (m) => {
+                const d = (m && m.data) || {};
+                if (d.phone_open && !started) statusDiv.innerText = 'Status: The box is open! Tap Setup Connection to hear the control room.';
+                if (d.stage === 'boiler') { closeCall(); live = false; }
+            });
+            OOCSI.subscribe(CH_WALKIE, (m) => onSignal((m && m.data) || {}));
+        } else {
+            statusDiv.innerText = 'Error: OOCSI script did not load. Check the internet connection and reload.';
+        }
+
+        /* ---------- WebRTC ---------- */
+        function closeCall() {
+            if (peerConnection) {
+                peerConnection.onicecandidate = peerConnection.ontrack = peerConnection.onconnectionstatechange = null;
+                try { peerConnection.close(); } catch (e) {}
+            }
+            peerConnection = null; pendingIce = []; live = false;
+        }
+
+        function createPeerConnection() {
+            peerConnection = new RTCPeerConnection(rtcConfig);
+            connectingSince = Date.now();
+
+            peerConnection.onicecandidate = (event) => {
+                if (event.candidate) send({ walkie: 'ice', cand: JSON.stringify(event.candidate) });
+            };
+
+            peerConnection.ontrack = (event) => {
+                remoteAudio.removeAttribute('src');
+                remoteAudio.srcObject = event.streams[0] || new MediaStream([event.track]);
+                remoteAudio.play().then(() => {
+                    live = true;
+                    statusDiv.innerText = 'Status: Audio is playing from control room!';
+                }).catch(() => {
+                    statusDiv.innerText = 'Status: Tap the screen to hear the control room.';
+                    document.body.onclick = () => remoteAudio.play().then(() => {
+                        document.body.onclick = null; live = true;
+                        statusDiv.innerText = 'Status: Audio is playing from control room!';
+                    }).catch(() => {});
+                });
+            };
+
+            peerConnection.onconnectionstatechange = () => {
+                const s = peerConnection ? peerConnection.connectionState : 'closed';
+                if (s === 'failed' || s === 'disconnected' || s === 'closed') {
+                    closeCall();
+                    if (started) { statusDiv.innerText = 'Status: Connection lost, connecting again...'; send({ walkie: 'ready' }); }
+                }
+            };
+        }
+
+        async function onSignal(d) {
+            if (!d.walkie || d.from === 'phone' || !started) return;
+            try {
+                if (d.walkie === 'offer') {
+                    createPeerConnection();
+                    statusDiv.innerText = 'Status: Connecting to the control room...';
+                    await peerConnection.setRemoteDescription(JSON.parse(d.sdp));
+                    for (const c of pendingIce) await peerConnection.addIceCandidate(c).catch(() => {});
+                    pendingIce = [];
+                    const answer = await peerConnection.createAnswer();
+                    await peerConnection.setLocalDescription(answer);
+                    send({ walkie: 'answer', sdp: JSON.stringify(peerConnection.localDescription) });
+                } else if (d.walkie === 'ice') {
+                    const c = JSON.parse(d.cand);
+                    if (peerConnection && peerConnection.remoteDescription) peerConnection.addIceCandidate(c).catch(() => {});
+                    else pendingIce.push(c);
+                } else if (d.walkie === 'bye') {
+                    closeCall();
+                    statusDiv.innerText = 'Status: Waiting for control room connection...';
+                    send({ walkie: 'ready' });
+                }
+            } catch (e) { console.error('Signalling error', e); }
+        }
+    </script>
+</body>
+</html>
