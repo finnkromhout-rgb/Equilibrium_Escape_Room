@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<!--
+  ====================================================================
+  WALKIE TALKIE - LAPTOP SENDER (microphone)
+  WHO MADE IT : OUR OWN MODULE (team 3) - made by us for this escape room (our own pages, adapted to OOCSI)
+  WHAT IT DOES: Sends the microphone sound one way to the phone. Starts by itself when the walkie talkie box opens (phone_open). Click 'Arm Microphone' once first.
+  WHERE IT RUNS: Served by our Express server (public/ folder, port 3000): http://localhost:3000/walkie_laptop_sender.html (see README_walkie_laptop.md)
+  ====================================================================
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Escape Room Walkie-Talkie - Laptop</title>
+    <style>
+        body { font-family: sans-serif; text-align: center; margin-top: 50px; }
+        button { padding: 15px 30px; font-size: 18px; margin: 10px; cursor: pointer; }
+        #status { font-weight: bold; margin-top: 20px; }
+        #info { margin-top: 12px; color: #555; font-size: 14px; }
+    </style>
+    <!-- OOCSI (an external address, so it works on localhost:3000 and on the tunnel link) -->
+    <script src="https://oocsi.id.tue.nl/assets/js/oocsi-web.js"></script>
+</head>
+<body>
+    <h1>Escape Room Control Room (Sender)</h1>
+    <div>
+        <button id="armBtn">Arm Microphone (starts by itself when the box opens)</button>
+    </div>
+    <div>
+        <button id="startSenderBtn">Start Transmission</button>
+    </div>
+    <div id="status">Status: Waiting on phone connection...</div>
+    <div id="info">OOCSI: connecting...</div>
+
+    <script>
+        /* =====================================================================
+           WALKIE TALKIE - LAPTOP (sender). One way: microphone -> phone.
+           The audio goes over WebRTC like before. The signalling (offer / answer / ICE candidates)
+           now goes over OOCSI instead of Socket.IO, so server.js only has to serve the files.
+
+           OOCSI channels
+             OOCSI-things/team-3-game     in : phone_open (the box opens -> start by itself)
+                                               stage 'boiler' (new run -> stop)
+             OOCSI-things/team-3-walkie   in/out: { walkie:'ready'|'offer'|'answer'|'ice'|'bye'|'status', from, sdp, cand }
+           Order does not matter: the phone keeps sending 'ready' until the audio is live.
+           ===================================================================== */
+        const CH_GAME   = 'OOCSI-things/team-3-game';
+        const CH_WALKIE = 'OOCSI-things/team-3-walkie';
+        const rtcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+
+        const statusDiv = document.getElementById('status');
+        const infoDiv = document.getElementById('info');
+
+        let peerConnection = null;
+        let localStream = null;
+        let active = false;          // transmitting (or waiting for the phone to ask)
+        let connectingSince = 0;
+        let pendingIce = [];
+
+        function send(d) { d.from = 'laptop'; try { OOCSI.send(CH_WALKIE, d); } catch (e) { console.warn(e); } }
+        // the main html shows this on its fire screen: 'live' | 'waiting' | 'noarm' | 'off'
+        function report(state) { send({ walkie: 'status', state: state }); }
+
+        /* ---------- OOCSI ---------- */
+        if (window.OOCSI) {
+            OOCSI.connect('wss://oocsi.id.tue.nl/ws');
+            OOCSI.subscribe(CH_GAME, (m) => {
+                const d = (m && m.data) || {};
+                if (d.phone_open) { console.log('phone_open: the box opens'); start(); }
+                if (d.stage === 'boiler') stop('new run');
+            });
+            OOCSI.subscribe(CH_WALKIE, (m) => onSignal((m && m.data) || {}));
+            infoDiv.innerText = 'OOCSI: connected';
+        } else {
+            infoDiv.innerText = 'OOCSI: script did not load, check the internet connection';
+        }
+
+        /* ---------- microphone ---------- */
+        async function arm() {
+            if (localStream) return true;
+            try {
+                statusDiv.innerText = 'Status: Accessing microphone...';
+                localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+                document.getElementById('armBtn').innerText = 'Microphone armed';
+                if (!active) statusDiv.innerText = 'Status: Microphone armed. Starts by itself when the box opens.';
+                return true;
+            } catch (err) {
+                statusDiv.innerText = 'Error: ' + err.message;
+                report('noarm');
+                return false;
+            }
+        }
+
+        /* ---------- start / stop (button or phone_open) ---------- */
+        async function start() {
+            if (active) return;
+            if (!(await arm())) return;
+            active = true;
+            statusDiv.innerText = 'Status: Transmitting, waiting for the phone to connect...';
+            report('waiting');
+        }
+        function stop(why) {
+            if (!active && !peerConnection) return;
+            active = false;
+            send({ walkie: 'bye' });
+            closeCall();
+            report('off');
+            statusDiv.innerText = 'Status: Stopped (' + why + '). Waiting on phone connection...';
+        }
+        document.getElementById('armBtn').onclick = () => { arm(); };
+        document.getElementById('startSenderBtn').onclick = () => { start(); };
+
+        /* ---------- WebRTC ---------- */
+        function closeCall() {
+            if (peerConnection) {
+                peerConnection.onicecandidate = peerConnection.onconnectionstatechange = null;
+                try { peerConnection.close(); } catch (e) {}
+            }
+            peerConnection = null; pendingIce = []; connectingSince = 0;
+        }
+
+        async function startCall() {
+            closeCall();
+            peerConnection = new RTCPeerConnection(rtcConfig);
+            connectingSince = Date.now();
+            localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
+
+            peerConnection.onicecandidate = (event) => {
+                if (event.candidate) send({ walkie: 'ice', cand: JSON.stringify(event.candidate) });
+            };
+
+            // Check when the WebRTC connection is actually online
+            peerConnection.onconnectionstatechange = () => {
+                const s = peerConnection ? peerConnection.connectionState : 'closed';
+                if (s === 'connected') {
+                    statusDiv.innerText = 'Status: Communication is online!';
+                    report('live');
+                    // Make the laptop speak out the notification aloud
+                    const utterance = new SpeechSynthesisUtterance('Communication is online');
+                    utterance.lang = 'en-US';
+                    window.speechSynthesis.speak(utterance);
+                } else if (s === 'failed' || s === 'disconnected' || s === 'closed') {
+                    if (active) { statusDiv.innerText = 'Status: Connection lost, reconnecting...'; report('waiting'); }
+                    closeCall();
+                }
+            };
+
+            const offer = await peerConnection.createOffer();
+            await peerConnection.setLocalDescription(offer);
+            send({ walkie: 'offer', sdp: JSON.stringify(peerConnection.localDescription) });
+        }
+
+        async function onSignal(d) {
+            if (!d.walkie || d.from === 'laptop') return;
+            try {
+                if (d.walkie === 'ready') {                     // the phone is listening and asks for audio
+                    if (!active) return;
+                    const st = peerConnection ? peerConnection.connectionState : 'none';
+                    const busy = st === 'connected' || ((st === 'connecting' || st === 'new') && Date.now() - connectingSince < 12000);
+                    if (busy) return;
+                    await startCall();
+                } else if (d.walkie === 'answer' && peerConnection) {
+                    await peerConnection.setRemoteDescription(JSON.parse(d.sdp));
+                    for (const c of pendingIce) await peerConnection.addIceCandidate(c).catch(() => {});
+                    pendingIce = [];
+                } else if (d.walkie === 'ice' && peerConnection) {
+                    const c = JSON.parse(d.cand);
+                    if (peerConnection.remoteDescription) peerConnection.addIceCandidate(c).catch(() => {});
+                    else pendingIce.push(c);
+                }
+            } catch (e) { console.error('Signalling error', e); }
+        }
+
+        window.addEventListener('beforeunload', () => { try { send({ walkie: 'bye' }); } catch (e) {} });
+    </script>
+</body>
+</html>
